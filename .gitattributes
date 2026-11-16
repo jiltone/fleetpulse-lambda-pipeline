@@ -1,0 +1,8 @@
+# Force Unix line endings for files that run inside Linux containers,
+# otherwise Windows checkouts (CRLF) break shell scripts and SQL init files.
+*.sh   text eol=lf
+*.sql  text eol=lf
+*.py   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+Makefile text eol=lf

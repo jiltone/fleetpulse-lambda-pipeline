@@ -1,0 +1,172 @@
+# =====================================================================
+# FleetPulse - Lambda architecture for ride-hailing fleet operations
+# All values in ${...} come from the .env file.
+# Phase 1: Kafka (KRaft) + topic setup + Kafka UI + PostgreSQL
+# Phase 2: telemetry producer (stream) + expense producer (daily CSV)
+# Phase 3: Spark Structured Streaming speed layer
+# =====================================================================
+name: fleetpulse
+
+services:
+
+  # ---------------- Ingestion: Apache Kafka in KRaft mode (no ZooKeeper) ----------------
+  kafka:
+    image: apache/kafka:3.8.0
+    hostname: kafka
+    ports:
+      - "${KAFKA_EXTERNAL_PORT}:29092"
+    environment:
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID}
+      KAFKA_NODE_ID: 1
+      # This single node is both the broker and the KRaft controller.
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # PLAINTEXT = for containers (kafka:9092), EXTERNAL = for the laptop (localhost:29092).
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:${KAFKA_EXTERNAL_PORT}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Only one broker, so every replication factor must be 1.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics are created explicitly by kafka-init (with the right partition count).
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m"   # keep RAM low for a laptop
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  # One-shot container that creates our topics, then exits.
+  kafka-init:
+    image: apache/kafka:3.8.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        KT=/opt/kafka/bin/kafka-topics.sh
+        # Main telemetry topic: 3 partitions, events keyed by vehicle_id so
+        # all events of one vehicle land in the same partition (= stay in order).
+        $$KT --bootstrap-server kafka:9092 --create --if-not-exists \
+             --topic ${KAFKA_TELEMETRY_TOPIC} --partitions ${KAFKA_TELEMETRY_PARTITIONS} --replication-factor 1
+        # Dead-letter queue for records that fail validation.
+        $$KT --bootstrap-server kafka:9092 --create --if-not-exists \
+             --topic ${KAFKA_DLQ_TOPIC} --partitions 1 --replication-factor 1
+        $$KT --bootstrap-server kafka:9092 --describe --topic ${KAFKA_TELEMETRY_TOPIC}
+        $$KT --bootstrap-server kafka:9092 --describe --topic ${KAFKA_DLQ_TOPIC}
+        echo "Kafka topics ready."
+    restart: "no"
+
+  # Web UI to browse topics, partitions and messages (handy for report screenshots).
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "${KAFKA_UI_PORT}:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: fleetpulse
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      JAVA_OPTS: "-Xms64m -Xmx256m"
+    restart: unless-stopped
+
+  # ---------------- Storage: PostgreSQL 16 ----------------
+  postgres:
+    image: postgres:16.4
+    ports:
+      - "${POSTGRES_HOST_PORT}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # Read by sql/00_airflow_db.sql to create Airflow's own database.
+      AIRFLOW_DB_USER: ${AIRFLOW_DB_USER}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      AIRFLOW_DB_NAME: ${AIRFLOW_DB_NAME}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Run once, on first start, in alphabetical order.
+      - ./sql/00_airflow_db.sql:/docker-entrypoint-initdb.d/00_airflow_db.sql:ro
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  # ---------------- Sources: simulated producers ----------------
+  telemetry-producer:
+    build:
+      context: .
+      dockerfile: producers/Dockerfile
+    image: fleetpulse/producers:1.0
+    command: ["python", "-m", "producers.telemetry_producer"]
+    env_file: .env
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully   # topics must exist first
+    volumes:
+      - ./data:/app/data          # shared sim-clock anchor file
+    ports:
+      - "${PRODUCER_METRICS_PORT}:${PRODUCER_METRICS_PORT}"   # Prometheus metrics
+    stop_grace_period: 15s        # time to flush buffered events on `docker stop`
+    restart: unless-stopped
+
+  expense-producer:
+    image: fleetpulse/producers:1.0
+    command: ["python", "-m", "producers.expense_batch_producer"]
+    env_file: .env
+    depends_on:
+      - telemetry-producer        # reuses the image built above
+    volumes:
+      - ./data:/app/data          # writes CSVs to ./data/landing, reads the anchor
+    ports:
+      - "${EXPENSE_METRICS_PORT}:${EXPENSE_METRICS_PORT}"
+    restart: unless-stopped
+
+  # ---------------- Speed layer: Spark Structured Streaming ----------------
+  spark-streaming:
+    build:
+      context: .
+      dockerfile: streaming/Dockerfile
+    image: fleetpulse/spark-streaming:1.0
+    # local[2] = Spark runs inside this one container using 2 CPU cores.
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - local[2]
+      - --driver-memory
+      - 1g
+      - /app/streaming/stream_processor.py
+    env_file: .env
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data          # Parquet lake, checkpoints, sim-clock anchor
+    ports:
+      - "${SPARK_UI_PORT}:4040"                                 # Spark UI
+      - "${STREAMING_METRICS_PORT}:${STREAMING_METRICS_PORT}"   # Prometheus metrics
+    mem_limit: 1800m
+    restart: unless-stopped       # on failure, restart and resume from the checkpoints
+
+volumes:
+  kafka_data:
+  postgres_data:

@@ -1,0 +1,8 @@
+# Keep the Docker build context small: data and reports are mounted, not copied.
+.git
+.env
+data/
+reports/
+**/__pycache__
+.venv
+venv
