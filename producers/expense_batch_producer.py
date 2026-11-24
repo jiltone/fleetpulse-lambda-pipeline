@@ -27,7 +27,7 @@ import time
 from datetime import date, timedelta
 from pathlib import Path
 
-from prometheus_client import Counter, start_http_server
+from prometheus_client import Counter, Gauge, start_http_server
 
 from common import sim_clock
 from common.config import get_float, get_int, get_str
@@ -39,8 +39,12 @@ log = get_logger("expense-producer", stage="ingestion")
 FILES_WRITTEN = Counter("expense_files_written_total", "Expense CSV files written to landing")
 ROWS_WRITTEN = Counter("expense_rows_written_total", "Expense rows written (including dirty rows)")
 DIRTY_ROWS = Counter("expense_dirty_rows_injected_total", "Deliberately dirty rows", ["kind"])
+# Starts at the producer's start time, then moves forward with every file written.
+# Prometheus alerts if it falls more than 1.5 simulated days behind ("file not arrived").
+LAST_FILE = Gauge("expense_last_file_timestamp", "Unix time of the last expense file (or producer start)")
 
 COLUMNS = ["vehicle_id", "fuel_cost", "maintenance_cost", "distance_covered", "service_flag", "expense_date"]
+MAINTENANCE_CYCLE_DAYS = 7  # high-cost vehicles' maintenance climbs for a week, then a repair resets it
 
 _running = True
 
@@ -55,25 +59,29 @@ def handle_signal(signum: int, _frame: object) -> None:
 def expense_for_vehicle(profile: VehicleProfile, expense_date: date) -> dict:
     """Generate one vehicle's expenses for one day (all money in LKR).
 
-    - normal vehicles: ~30 LKR/km fuel, small daily maintenance
+    - normal vehicles: ~50 LKR/km fuel (about 350 LKR/litre at 7 km/litre),
+      modest daily maintenance -> roughly 50-60% margin
     - lazy vehicles: drive less, so lower distance and fuel
-    - high-cost vehicles: inefficient (~65 LKR/km) and maintenance that grows
-      20% per simulated day, so their profit keeps falling ("trending unprofitable")
+    - high-cost vehicles: old and inefficient (~95 LKR/km) with maintenance that
+      grows 30% of its base per simulated day over a 7-day cycle -> loss-making
+      and getting worse ("trending"), then reset by a repair so costs stay
+      realistic however long the stack runs. They are always flagged for service.
     """
     rng = random.Random(f"{profile.vehicle_id}-{expense_date.isoformat()}")
     day_index = max(sim_clock.sim_day_index(expense_date), 0)
 
     if profile.high_cost:
-        distance = rng.uniform(160, 260)
-        fuel = distance * rng.uniform(60, 75)
-        maintenance = rng.uniform(5000, 9000) * (1 + 0.20 * day_index)
-        service = rng.random() < 0.30
-        if service:
-            maintenance += rng.uniform(6000, 12000)
+        distance = rng.uniform(180, 260)
+        fuel = distance * rng.uniform(88, 100)
+        # A steady 30%-of-base rise per day, no random spikes, so the decline is a clear
+        # trend. The cycle resets weekly; unbounded growth reached ~360x base after a
+        # week of real running (1 sim day = 10 real minutes).
+        maintenance = rng.uniform(9000, 10000) * (1 + 0.30 * (day_index % MAINTENANCE_CYCLE_DAYS))
+        service = True
     else:
-        distance = rng.uniform(50, 110) if profile.lazy else rng.uniform(140, 260)
-        fuel = distance * rng.uniform(28, 36)
-        maintenance = rng.uniform(300, 1500)
+        distance = rng.uniform(50, 110) if profile.lazy else rng.uniform(150, 250)
+        fuel = distance * rng.uniform(45, 55)
+        maintenance = rng.uniform(1500, 3500)
         service = rng.random() < 0.05
         if service:
             maintenance += rng.uniform(4000, 9000)
@@ -120,6 +128,7 @@ def write_expense_file(expense_date: date, landing_dir: Path) -> Path:
     write_csv_atomically(rows, target)
     FILES_WRITTEN.inc()
     ROWS_WRITTEN.inc(len(rows))
+    LAST_FILE.set(time.time())
     log.info(
         "Expense file written",
         event="expense_file_written",
@@ -160,6 +169,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
     start_http_server(get_int("EXPENSE_METRICS_PORT", 8002))
+    LAST_FILE.set(time.time())
     run_forever(landing_dir, get_float("EXPENSE_POLL_SECONDS", 5))
 
 

@@ -8,7 +8,8 @@ a micro-batch after a crash, rows are overwritten, never duplicated.
 """
 from __future__ import annotations
 
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 from typing import Any
 
 import psycopg2
@@ -24,8 +25,19 @@ def connect() -> PgConnection:
     A fresh connection per micro-batch is simple and thread-safe (Spark runs
     the callbacks of different queries in different threads); at one batch
     every 10 s the cost is negligible.
+
+    Retries with backoff: on a busy host a single slow handshake should delay
+    the batch, not kill the streaming query (which forces a full restart).
     """
-    return psycopg2.connect(postgres_dsn(), connect_timeout=5)
+    attempts = 4
+    for attempt in range(1, attempts + 1):
+        try:
+            return psycopg2.connect(postgres_dsn(), connect_timeout=15)
+        except psycopg2.OperationalError:
+            if attempt == attempts:
+                raise
+            time.sleep(2 * attempt)
+    raise AssertionError("unreachable")
 
 
 # ------------------------------------------------------------------ zone metrics
@@ -91,6 +103,13 @@ def fetch_current_status(conn: PgConnection) -> dict[str, dict[str, Any]]:
         }
 
 
+def as_utc(value: datetime | None) -> datetime | None:
+    """Treat a naive datetime as UTC; leave aware ones (and None) unchanged."""
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
 def merge_vehicle_status(
     current: dict[str, dict[str, Any]], events: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -105,13 +124,16 @@ def merge_vehicle_status(
     """
     by_vehicle: dict[str, list[dict[str, Any]]] = {}
     for e in events:
+        # Spark's collect() yields naive datetimes (session time zone = UTC) while
+        # Postgres TIMESTAMPTZ columns come back aware; make both aware UTC.
+        e = {**e, "event_time": as_utc(e["event_time"])}
         by_vehicle.setdefault(e["vehicle_id"], []).append(e)
 
     merged = []
     for vid, vehicle_events in by_vehicle.items():
         prev = current.get(vid)
-        idle_since: datetime | None = prev["idle_since"] if prev and prev["status"] == "idle" else None
-        last_time: datetime | None = prev["event_time"] if prev else None
+        idle_since: datetime | None = as_utc(prev["idle_since"]) if prev and prev["status"] == "idle" else None
+        last_time: datetime | None = as_utc(prev["event_time"]) if prev else None
         latest = None
         for e in sorted(vehicle_events, key=lambda ev: ev["event_time"]):
             if last_time is not None and e["event_time"] < last_time:
@@ -176,6 +198,13 @@ ON CONFLICT (vehicle_id) WHERE status = 'open'
 DO UPDATE SET idle_sim_minutes = EXCLUDED.idle_sim_minutes, zone = EXCLUDED.zone
 RETURNING vehicle_id, driver_id, zone, idle_sim_minutes, (xmax = 0) AS is_new
 """
+
+
+def count_open_alerts(conn: PgConnection) -> int:
+    """Number of idle alerts currently open (exported as a Prometheus gauge)."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM idle_alerts WHERE status = 'open'")
+        return int(cur.fetchone()[0])
 
 
 def refresh_idle_alerts(conn: PgConnection, threshold_real_s: float, speedup: float) -> tuple[list[dict], list[str]]:
