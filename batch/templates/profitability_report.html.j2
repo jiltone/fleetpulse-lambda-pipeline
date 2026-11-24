@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fleet Profitability {{ sim_date }}</title>
+<style>
+  :root {
+    --surface: #fcfcfb; --surface-2: #f3f2ef; --border: #e4e3df;
+    --text: #0b0b0b; --text-2: #52514e; --loss: #e34948; --loss-bg: #fdecec; --profit: #2a78d6;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--surface); color: var(--text);
+         font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 1040px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 32px 0 12px; }
+  .sub { color: var(--text-2); margin: 0; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-top: 20px; }
+  .kpi { background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+  .kpi .label { color: var(--text-2); font-size: 12px; }
+  .kpi .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .chart img { width: 100%; height: auto; border: 1px solid var(--border); border-radius: 8px; }
+  .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { padding: 7px 10px; text-align: right; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th:first-child, td:first-child, th.l, td.l { text-align: left; }
+  th { background: var(--surface-2); font-size: 12px; color: var(--text-2); position: sticky; top: 0; }
+  tr.unprofitable td { background: var(--loss-bg); }
+  tr.unprofitable td:first-child { box-shadow: inset 3px 0 0 var(--loss); font-weight: 600; }
+  .badge { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 10px;
+           border: 1px solid var(--loss); color: var(--text); margin-left: 4px; }
+  .dq { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 8px 24px; color: var(--text-2); }
+  .dq b { color: var(--text); font-variant-numeric: tabular-nums; }
+  footer { margin-top: 40px; color: var(--text-2); font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Daily Fleet Profitability Report</h1>
+  <p class="sub">Simulated day <b>{{ sim_date }}</b> &middot; generated {{ generated_at }} &middot;
+     unprofitable = loss or margin below {{ (margin_threshold * 100) | round(0) | int }}%</p>
+
+  <section class="kpis" aria-label="Summary">
+    <div class="kpi"><div class="label">Fleet earnings (LKR)</div><div class="value">{{ summary.earnings | money }}</div></div>
+    <div class="kpi"><div class="label">Fuel + maintenance (LKR)</div><div class="value">{{ summary.total_cost | money }}</div></div>
+    <div class="kpi"><div class="label">Fleet profit (LKR)</div><div class="value">{{ summary.profit | money }}</div></div>
+    <div class="kpi"><div class="label">Fleet margin</div><div class="value">{{ summary.margin | pct }}</div></div>
+    <div class="kpi"><div class="label">Trips completed</div><div class="value">{{ summary.trips }}</div></div>
+    <div class="kpi"><div class="label">Unprofitable vehicles</div><div class="value">{{ summary.unprofitable }} / {{ summary.vehicles }}</div></div>
+    <div class="kpi"><div class="label">Trending unprofitable</div><div class="value">{{ summary.trending }}</div></div>
+  </section>
+
+  <h2>Profit per vehicle</h2>
+  <div class="chart"><img src="data:image/png;base64,{{ chart_png }}" alt="Bar chart of daily profit per vehicle; loss-making vehicles in red at the top"></div>
+
+  <h2>All vehicles</h2>
+  <div class="table-wrap">
+  <table>
+    <thead><tr>
+      <th>Vehicle</th><th>Trips</th><th>Earnings</th><th>Fuel</th><th>Maintenance</th>
+      <th>Profit</th><th>Margin</th><th>km</th><th>Cost / km</th><th class="l">Status</th>
+    </tr></thead>
+    <tbody>
+    {% for r in rows %}
+      <tr class="{{ 'unprofitable' if r.is_unprofitable else '' }}">
+        <td>{{ r.vehicle_id }}</td>
+        <td>{{ r.trips_completed }}</td>
+        <td>{{ r.earnings | money }}</td>
+        <td>{{ r.fuel_cost | money }}</td>
+        <td>{{ r.maintenance_cost | money }}</td>
+        <td>{{ r.profit | money }}</td>
+        <td>{{ r.profit_margin | pct }}</td>
+        <td>{{ r.distance_covered | money }}</td>
+        <td>{{ r.cost_per_km | money }}</td>
+        <td class="l">
+          {% if r.is_unprofitable %}Unprofitable{% else %}OK{% endif %}
+          {% if r.trending_unprofitable %}<span class="badge">&#9660; falling {{ r.consecutive_profit_drops }} days</span>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+
+  {% if quality %}
+  <h2>Data quality</h2>
+  <div class="dq">
+    {% for label, value in quality.items() %}<div>{{ label }}: <b>{{ value }}</b></div>{% endfor %}
+  </div>
+  {% endif %}
+
+  <footer>FleetPulse batch layer &middot; earnings recomputed from the raw Parquet lake (source of truth) &middot;
+    P.S. Dilshan (EG/2020/3898)</footer>
+</main>
+</body>
+</html>
