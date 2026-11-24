@@ -20,3 +20,9 @@ reports/*
 .idea/
 Thumbs.db
 .DS_Store
+
+# Report, presentation and notes are submitted separately, not through the repo
+docs/
+
+# Local tool settings
+.claude/
