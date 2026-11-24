@@ -1,0 +1,49 @@
+# Grafana-managed alert rules (in addition to the Prometheus rules).
+# This one queries PostgreSQL directly, which Prometheus cannot do:
+# it fires when the speed layer has open idle alerts.
+#   A = SQL query -> B = take the last value -> C = is it above 0?
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: fleet-business
+    folder: FleetPulse
+    interval: 30s
+    rules:
+      - uid: vehicle-idle-too-long
+        title: Vehicle idle too long
+        condition: C
+        for: 30s
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: info
+          kind: business
+        annotations:
+          summary: "One or more vehicles have been idle longer than the configured threshold"
+          description: "Open the Fleet Operations dashboard -> 'Open idle alerts' for vehicles and zones."
+        data:
+          - refId: A
+            datasourceUid: fleet-postgres
+            relativeTimeRange: {from: 600, to: 0}
+            model:
+              refId: A
+              editorMode: code
+              rawQuery: true
+              format: table
+              rawSql: "SELECT COUNT(*)::float AS open_idle_alerts FROM idle_alerts WHERE status = 'open'"
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: {type: gt, params: [0]}

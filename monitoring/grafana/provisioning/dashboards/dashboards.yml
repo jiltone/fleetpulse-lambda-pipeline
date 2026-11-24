@@ -1,0 +1,12 @@
+# Load every dashboard JSON from /var/lib/grafana/dashboards into the "FleetPulse" folder.
+apiVersion: 1
+
+providers:
+  - name: fleetpulse
+    folder: FleetPulse
+    type: file
+    disableDeletion: true
+    updateIntervalSeconds: 30     # picks up regenerated JSON without a restart
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

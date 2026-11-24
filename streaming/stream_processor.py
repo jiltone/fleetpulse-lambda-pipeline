@@ -51,6 +51,7 @@ BATCH_DURATION = Histogram(
 )
 LAST_EVENT = Gauge("last_event_timestamp", "Unix time (event time) of the newest valid event seen")
 IDLE_ALERTS_OPENED = Counter("idle_alerts_opened_total", "Idle alerts raised by the speed layer")
+IDLE_ALERTS_OPEN = Gauge("idle_alerts_open", "Idle alerts currently open (business alert source)")
 
 
 def timed_batch(query: str) -> Callable:
@@ -150,6 +151,7 @@ def process_clean_batch(batch_df: DataFrame, batch_id: int) -> None:
             statuses = pg.merge_vehicle_status(pg.fetch_current_status(conn), events)
             pg.upsert_vehicle_status(conn, statuses)
             new_alerts, resolved = pg.refresh_idle_alerts(conn, threshold_s, sim_clock.speedup())
+            IDLE_ALERTS_OPEN.set(pg.count_open_alerts(conn))
 
         # (c) Observability
         for alert in new_alerts:

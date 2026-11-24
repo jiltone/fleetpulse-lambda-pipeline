@@ -1,0 +1,100 @@
+# FleetPulse alert rules.
+# `for:` = the condition must stay true this long before the alert fires
+# (avoids alerting on a single slow scrape). Time thresholds assume
+# SIM_DAY_SECONDS=600; change them together if you change the sim clock.
+groups:
+  # ------------------------------------------------------------------ 1. data freshness
+  - name: data-freshness
+    rules:
+      - alert: NoDataReceived
+        # last_event_timestamp = event time of the newest valid event the speed layer stored.
+        expr: time() - last_event_timestamp > 120
+        for: 30s
+        labels: {severity: critical, stage: processing}
+        annotations:
+          summary: "No telemetry processed for {{ $value | humanizeDuration }}"
+          description: "The speed layer has not stored a new event for over 2 minutes. Check the telemetry producer, Kafka and the Spark job."
+
+      - alert: TelemetryProducerDown
+        expr: up{job="telemetry-producer"} == 0
+        for: 30s
+        labels: {severity: critical, stage: ingestion}
+        annotations:
+          summary: "Telemetry producer is not reachable"
+          description: "Prometheus cannot scrape the producer: the process has stopped or crashed."
+
+      - alert: SparkStreamingDown
+        expr: up{job="spark-streaming"} == 0
+        for: 1m
+        labels: {severity: critical, stage: processing}
+        annotations:
+          summary: "Spark streaming job is not reachable"
+          description: "The speed layer is down; real-time tables and idle alerts are no longer updated."
+
+  # ------------------------------------------------------------------ 2. data quality
+  - name: data-quality
+    rules:
+      - alert: HighDLQRate
+        # Share of records rejected to the dead-letter queue over the last 2 minutes.
+        # Normal level is ~2% (the producer injects that many bad records on purpose).
+        expr: |
+          sum(rate(stream_records_dlq_total[2m]))
+            /
+          (sum(rate(stream_records_dlq_total[2m])) + sum(rate(stream_records_processed_total{query="clean_events"}[2m])))
+            > 0.05
+        for: 1m
+        labels: {severity: warning, stage: processing}
+        annotations:
+          summary: "DLQ rate is {{ $value | humanizePercentage }} (limit 5%)"
+          description: "An unusually high share of telemetry is invalid. Possible upstream schema change or broken sensors."
+
+  # ------------------------------------------------------------------ 3. batch layer
+  - name: batch-layer
+    rules:
+      - alert: BatchJobFailed
+        # batch_runs_total is pushed after every DAG run; any increase of failed runs fires.
+        expr: delta(batch_runs_total{status="failed"}[15m]) > 0
+        labels: {severity: critical, stage: processing}
+        annotations:
+          summary: "daily_fleet_reconciliation failed"
+          description: "A batch run failed (task error, data-quality check, or the expense file never arrived). Profitability for that day is missing."
+
+      - alert: ExpenseFileMissing
+        # 900 s = 1.5 simulated days without a new expense file.
+        expr: time() - expense_last_file_timestamp > 900
+        for: 30s
+        labels: {severity: warning, stage: ingestion}
+        annotations:
+          summary: "No expense file for over 1.5 simulated days"
+          description: "The daily expense CSV has not arrived; the batch layer cannot compute profitability."
+
+      - alert: BatchStale
+        # 1500 s = 2.5 simulated days since the last successful DAG run.
+        expr: time() - batch_last_success_timestamp > 1500
+        for: 1m
+        labels: {severity: warning, stage: processing}
+        annotations:
+          summary: "No successful batch run for over 2.5 simulated days"
+          description: "The profitability report is out of date. Check the Airflow scheduler and DAG runs."
+
+  # ------------------------------------------------------------------ 4. business
+  - name: business
+    rules:
+      - alert: VehicleIdleTooLong
+        expr: idle_alerts_open > 0
+        for: 30s
+        labels: {severity: info, stage: processing, kind: business}
+        annotations:
+          summary: "{{ $value }} vehicle(s) idle longer than the threshold"
+          description: "See GET /alerts/idle or the Fleet Operations dashboard for the vehicles and zones."
+
+  # ------------------------------------------------------------------ serving
+  - name: serving
+    rules:
+      - alert: ApiDown
+        expr: up{job="api"} == 0
+        for: 1m
+        labels: {severity: critical, stage: serving}
+        annotations:
+          summary: "FleetPulse API is not reachable"
+          description: "Dashboards and clients cannot read the serving layer."

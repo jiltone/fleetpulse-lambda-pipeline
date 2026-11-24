@@ -1,0 +1,37 @@
+# Prometheus: scrapes (pulls) metrics from every long-running service every 5 s
+# and evaluates the alert rules every 10 s.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 10s
+
+rule_files:
+  - /etc/prometheus/alert_rules.yml
+
+scrape_configs:
+  - job_name: telemetry-producer        # ingestion
+    static_configs:
+      - targets: ["telemetry-producer:8001"]
+
+  - job_name: expense-producer          # ingestion (daily files)
+    static_configs:
+      - targets: ["expense-producer:8002"]
+
+  - job_name: spark-streaming           # speed layer
+    static_configs:
+      - targets: ["spark-streaming:8003"]
+
+  - job_name: api                       # serving layer
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8000"]
+
+  # Airflow tasks are short-lived, so they PUSH to the Pushgateway and Prometheus
+  # scrapes the gateway. honor_labels keeps the job label the tasks pushed.
+  - job_name: pushgateway               # batch layer
+    honor_labels: true
+    static_configs:
+      - targets: ["pushgateway:9091"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
